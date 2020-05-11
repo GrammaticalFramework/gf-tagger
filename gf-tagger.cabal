@@ -1,0 +1,35 @@
+Cabal-Version:       >= 1.6
+Build-Type:          Simple
+Tested-With:         GHC
+Category:            Math
+Name:                gf-tagger
+Version:             0.3.11
+Stability:           experimental
+License:             GPL
+Copyright:           (c) 2020- Krasimir Angelov
+Author:              Felipe A. Lessa (Haskell code), William W. Hager and Hongchao Zhang (CM_DESCENT code).
+Maintainer:          Felipe A. Lessa <felipe.lessa@gmail.com>
+
+Flag Debug
+  Description: Enable some debug statements.
+  Default:     False
+
+Executable gf-tagger
+  main-is: gf-tagger.hs
+  Other-Modules:
+      HagerZhang05
+  Include-Dirs:
+    src
+  C-Sources:
+    src/cg_descent.c
+  Build-Depends:
+      base      >= 3   && < 5
+    , vector    >= 0.5 && <= 0.13
+    , containers
+    , pgf2
+    
+  Build-Tools:     hsc2hs
+  Extra-Libraries: m
+  if flag(Debug)
+    CPP-Options: -DDEBUG
+  hs-Source-Dirs: src/
