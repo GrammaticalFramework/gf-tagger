@@ -3,6 +3,7 @@ import PGF2
 import Data.Maybe
 import Data.Either
 import Data.List
+import Data.Char
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as Map
 import qualified Data.Vector as V
@@ -12,7 +13,6 @@ import Control.Monad
 import HagerZhang05
 import System.Environment
 import GHC.Float
-import Debug.Trace
 
 main = do
   args <- getArgs
@@ -82,7 +82,7 @@ doTraining gr cnc corpus_path out_path = do
                              fun grad (Just comb)
   putStrLn ("Model saved in "++out_path)
   writeModel out_path (Set.fromList [w | Word w <- Map.keys tcounts])
-                      [((i,val,y2tag V.! t),lam VS.! i) | ((i,val),(Right hists,tags)) <- Map.toList fvalues, (i,t,c) <- tags]
+                      [((i,val,y2tag V.! t),lam VS.! j) | ((i,val),(Right hists,tags)) <- Map.toList fvalues, (j,t,c) <- tags]
   where
     toExpr ('a':'b':'s':':':' ':ls) = readExpr ls
     toExpr _                        = Nothing
@@ -104,7 +104,7 @@ doTraining gr cnc corpus_path out_path = do
 doTagging gr cnc model_path corpus_path output_path = do
   putStrLn ("Reading "++model_path)
   model <- readModel model_path
-  ls <- fmap (map (map (toTags model Map.empty) . lookupCohorts cnc True) . lines) $ readFile corpus_path
+  ls <- fmap (map (map (toTags model Map.empty) . filterBest . lookupCohorts cnc) . lines) $ readFile corpus_path
   putStrLn ("Output saved in "++output_path)
   writeFile output_path ((unlines . concat . intersperse [""]) (map (map show . tagSentence model left3words [(replicate 2 START,(0,[]))]) ls))
   where
@@ -155,7 +155,6 @@ doTagging gr cnc model_path corpus_path output_path = do
         max (p1,ann1) (p2,ann2)
           | p1 > p2   = (p1,ann1)
           | otherwise = (p2,ann2)
-
 
 doHelp = do
   name <- getProgName
