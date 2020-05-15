@@ -11,6 +11,8 @@ import qualified Data.Vector.Storable as VS
 import qualified Data.Vector.Storable.Mutable as MV
 import Control.Monad
 import HagerZhang05
+import System.Random
+import System.Random.Shuffle
 import System.Environment
 import GHC.Float
 
@@ -26,22 +28,104 @@ main = do
                               case args of
                                 ["-train",ex_path,out_path]
                                    -> doTraining gr cnc ex_path out_path
+                                ["-test", ex_path]
+                                   -> doTesting gr cnc ex_path
                                 ["-tag",model_path,inp_path,out_path]
                                    -> doTagging gr cnc model_path inp_path out_path
                                 _  -> doHelp
     _                              -> doHelp
 
 doTraining gr cnc corpus_path out_path = do
-  es <- fmap (mapMaybe toExpr . lines) $ readFile corpus_path
+  es <- readCorpus corpus_path
   putStrLn ("Read "++show (length es)++" sentences")
   let hcounts0     = emptyIndex
-      (tcounts0,_) = 
-          mapAccumL addIndex emptyIndex
-                    [Tag cat an | (w,ans) <- fullFormLexicon cnc, (f,an,_) <- ans
-                                , Just (_,cat,_) <- [fmap unType (functionType gr f)]]
+      (tcounts0,_) = getLexicalTags gr cnc
       fvalues0     = emptyIndex
-      contexts     = map getContexts es
-      wordCounts   = foldl' (foldl' addWordCount) Map.empty contexts
+      contexts     = map (getContexts gr cnc) es
+  model <- trainModel hcounts0 tcounts0 fvalues0 contexts
+  putStrLn ("Model saved in "++out_path)
+  writeModel out_path model
+
+doTesting gr cnc corpus_path = do
+  es <- readCorpus corpus_path
+  let es_len = length es
+  putStrLn ("Read "++show es_len++" sentences")
+  g <- newStdGen
+  let hcounts0     = emptyIndex
+      (tcounts0,_) = getLexicalTags gr cnc
+      fvalues0     = emptyIndex
+      all_contexts = map (getContexts gr cnc) es
+      len          = es_len `div` 10
+      partition    = chunk (shuffle' all_contexts es_len g) [] es_len len
+  as <- cross_validate hcounts0 tcounts0 fvalues0 1 partition
+  print as
+  print (sum as / fromIntegral (length as))
+  where
+    chunk xs yss l len
+      | l-len < len = [(concat yss,xs)]
+      | otherwise   = let (ys,zs) = splitAt len xs
+                      in (concat (zs:yss),ys) :
+                         chunk zs (ys:yss) (l-len) len
+
+    cross_validate hcounts0 tcounts0 fvalues0 i []                                    = return []
+    cross_validate hcounts0 tcounts0 fvalues0 i ((tr_contexts,ev_contexts):partition) = do
+      putStrLn ("Evaluation on partion "++show i)
+      model <- trainModel hcounts0 tcounts0 fvalues0 tr_contexts
+      (c,t) <- evaluate model ev_contexts 0 0
+      let a = fromIntegral c/fromIntegral t
+      print (c,t,a)
+      as <- cross_validate hcounts0 tcounts0 fvalues0 (i+1) partition
+      return (a:as)
+      where
+        evaluate model []                     c t = return (c,t)
+        evaluate model (contexts:ev_contexts) c t = do
+          let sent = contexts2sentence "" contexts
+          (c,t) <- count sent (map restoreTag (tagSentence gr cnc model sent)) contexts c t
+          evaluate model ev_contexts c t
+
+        contexts2sentence space []                       = ""
+        contexts2sentence space (BIND_TAG     :contexts) =
+          contexts2sentence "" contexts
+        contexts2sentence space (Word w       :contexts) =
+          space++w++contexts2sentence " " contexts
+        contexts2sentence space (WordTag w _ _:contexts) =
+          space++w++contexts2sentence " " contexts
+
+        count sent []           []           !c !t = return (c,t)
+        count sent (tag1:tags1) (tag2:tags2) !c !t
+          | tag1 == tag2 = count sent tags1 tags2 (c+1) (t+1)
+          | otherwise    = count sent tags1 tags2 c     (t+1)
+        count sent tags1        tags2        !c !t = do
+          putStrLn "Warning: missmatching sizes, for:"
+          putStrLn sent
+          return (c,t)
+
+        restoreTag (i,w,[],j)                     = Word w
+        restoreTag (i,w,(fn,field,fn_prob):ans,j) = WordTag w cat field
+          where
+            Just (_,cat,_) = fmap unType (functionType gr fn)
+
+getLexicalTags gr cnc =
+  mapAccumL addIndex emptyIndex
+            [Tag cat an | (w,ans) <- fullFormLexicon cnc, (f,an,_) <- ans
+                        , Just (_,cat,_) <- [fmap unType (functionType gr f)]]
+
+getContexts :: PGF -> Concr -> Expr -> [Context]
+getContexts gr cnc e = concatMap tags (bracketedLinearize cnc e)
+  where
+	tags (Leaf w)                = [Word w]
+	tags BIND                    = [BIND_TAG]
+	tags b@(Bracket cat _ an fun bs)
+	  | arity fun == Just 0      = [WordTag (unwords (flattenBracketedString b)) cat an]
+	  | otherwise                = concatMap tags bs
+
+	arity fun =
+	  case fmap unType (functionType gr fun) of
+		Just (hs,_,_) -> Just (length hs)
+		Nothing       -> Nothing
+
+trainModel hcounts0 tcounts0 fvalues0 contexts = do
+  let wordCounts   = foldl' (foldl' addWordCount) Map.empty contexts
       (cSize,hcounts,tcounts,fvalues1) =
           foldl (\st -> extractFeatures wordCounts left3words naacl2003unknowns st)
                 (0,hcounts0,tcounts0,fvalues0)
@@ -50,8 +134,7 @@ doTraining gr cnc corpus_path out_path = do
       y2tag =
         V.replicate (Map.size hcounts) undefined V.// 
                     [(i, t) | (t,(i,c)) <- Map.toList tcounts]
-  putStrLn ("Processed "++show (cSize-length es)++" words")
-  putStrLn (show (sum (map snd (Map.toList wordCounts))))
+  putStrLn ("Processed "++show (cSize-length contexts)++" words")
   putStrLn ("Found that xSize="++show (Map.size hcounts)++" and ySize="++show (Map.size tcounts))
   putStrLn ("Found "++show (Map.size fvalues)++" unique features")
   putStrLn ("Found "++show (sum (fmap (\(_,tags) -> length tags) fvalues))++" templates, "++
@@ -60,37 +143,27 @@ doTraining gr cnc corpus_path out_path = do
   (lam,res,stat) <- optimize defaultParameters{verbose=VeryVerbose} 1e-4
                              (VS.replicate fSize 0.0)
                              fun grad (Just comb)
-  putStrLn ("Model saved in "++out_path)
-  writeModel out_path (Set.fromList [w | Word w <- Map.keys tcounts])
-                      [((val,y2tag V.! t),lam VS.! j) | (val,(Right hists,tags)) <- Map.toList fvalues, (j,t,c) <- tags]
+  return (Set.fromList [w | Word w <- Map.keys tcounts]
+         ,Map.fromList [((val,y2tag V.! t),lam VS.! j) | (val,(Right hists,tags)) <- Map.toList fvalues, (j,t,c) <- tags]
+         )
   where
-    toExpr ('a':'b':'s':':':' ':ls) = readExpr ls
-    toExpr _                        = Nothing
-
-    getContexts :: Expr -> [Context]
-    getContexts e = concatMap tags (bracketedLinearize cnc e)
-      where
-        tags (Leaf w)                = [Word w]
-        tags BIND                    = [BIND_TAG]
-        tags b@(Bracket cat _ an fun bs)
-          | arity fun == Just 0      = [WordTag (unwords (flattenBracketedString b)) cat an]
-          | otherwise                = concatMap tags bs
-
-        arity fun =
-          case fmap unType (functionType gr fun) of
-            Just (hs,_,_) -> Just (length hs)
-            Nothing       -> Nothing
-
     addWordCount counts (Word w)        = Map.insertWith (+) w 1 counts
     addWordCount counts (WordTag w _ _) = Map.insertWith (+) w 1 counts
     addWordCount counts _               = counts
 
+
 doTagging gr cnc model_path corpus_path output_path = do
   putStrLn ("Reading "++model_path)
   model <- readModel model_path
-  ls <- fmap (map (map (toTags model Map.empty) . filterBest . lookupCohorts cnc) . lines) $ readFile corpus_path
+  ls <- fmap lines $ readFile corpus_path
   putStrLn ("Output saved in "++output_path)
-  writeFile output_path ((unlines . concat . intersperse [""]) (map (map show . tagSentence model left3words naacl2003unknowns [(replicate 2 START,(0,[]))]) ls))
+  writeFile output_path ((unlines . concat . intersperse [""] . map (map show .tagSentence gr cnc model)) ls)
+  
+tagSentence gr cnc model =
+  bestSeq model left3words naacl2003unknowns [(replicate 2 START,(0,[]))] .
+  map (toTags model Map.empty) .
+  filterBest .
+  lookupCohorts cnc
   where
     toTags model tags (i,w,[]                       ,j) =
       let context0 = Map.toList tags
@@ -108,16 +181,16 @@ doTagging gr cnc model_path corpus_path output_path = do
                       Map.insert tag (i,w,an:ans,j) tags
       in toTags model tags' (i,w,ans,j)
 
-    tagSentence model extractorsG extractorsR lefts []                     =
+    bestSeq model extractorsG extractorsR lefts []                     =
       head [reverse anns | (left,(p,anns)) <- lefts, p == maximum [p | (left,(p,anns)) <- lefts]]
-    tagSentence model extractorsG extractorsR lefts ((wtag,context):right) =
+    bestSeq model extractorsG extractorsR lefts ((wtag,context):right) =
       let lefts' =
             argMax [left'
                       | left  <- lefts
                       , left' <- shift model extractorsG extractorsR
                                        left wtag context (map fst right++repeat END)
                    ]
-      in tagSentence model extractorsG extractorsR lefts' right
+      in bestSeq model extractorsG extractorsR lefts' right
 
     shift (words,probs) extractorsG extractorsR (left,(p,anns)) wtag context right =
       norm [(comb wtag tag:init left,lambdas tag,ann:anns) | (tag,ann) <- context]
@@ -144,6 +217,7 @@ doHelp = do
   name <- getProgName
   putStrLn ("Synopsis:")
   putStrLn ("   "++name++"<pgf path> <concrete syntax> -train <examples path> <output path>")
+  putStrLn ("   "++name++"<pgf path> <concrete syntax> -test  <examples path>")
   putStrLn ("   "++name++"<pgf path> <concrete syntax> -tag   <model path> <input path> <output path>")
   putStrLn ("")
   putStrLn ("<examples path> must contain abstract syntax trees, one per line prefixed with \"abs:\"")
@@ -300,11 +374,17 @@ maxentProblem sigmaSquared hcounts tcounts fvalues =
           pc <- MV.read probConds (ht h t)
           getSum probConds hs t (s + (ptilde VS.! h) * pc)
 
+readCorpus corpus_path =
+  fmap (take 1000 . mapMaybe toExpr . lines) $ readFile corpus_path
+  where
+    toExpr ('a':'b':'s':':':' ':ls) = readExpr ls
+    toExpr _                        = Nothing
+  
 readModel model_path = do
   (l:ls) <- fmap lines $ readFile model_path
   let ws    = Set.fromList (read l)
       probs = Map.fromList (map read ls)
   return (ws,probs)
 
-writeModel model_path words probs = do
-  writeFile model_path (unlines (show (Set.toList words) : map show probs))
+writeModel model_path (words,probs) = do
+  writeFile model_path (unlines (show (Set.toList words) : map show (Map.toList probs)))
