@@ -18,6 +18,8 @@ Executable gf-tagger
   main-is: gf-tagger.hs
   Other-Modules:
       HagerZhang05
+      Context
+      Features
   Include-Dirs:
     src
   C-Sources:

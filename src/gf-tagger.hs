@@ -14,6 +14,9 @@ import HagerZhang05
 import System.Environment
 import GHC.Float
 
+import Context
+import Features
+
 main = do
   args <- getArgs
   case args of
@@ -28,32 +31,6 @@ main = do
                                 _  -> doHelp
     _                              -> doHelp
 
-type Token = String
-data Context
-  = START
-  | Tag           Cat String
-  | Word    Token
-  | WordTag Token Cat String
-  | BIND_TAG
-  | END
-  deriving (Show,Read,Eq,Ord)
-
-wordOnly (Tag       _ _) = error "missing word"
-wordOnly (Word    t)     = Word t
-wordOnly (WordTag t _ _) = Word t
-wordOnly tag             = tag
-
-tagOnly (Word t)           = Word t
-tagOnly (WordTag t cat an) = Tag cat an
-tagOnly tag                = tag
-
-showContexts START              = "*START*"
-showContexts (Tag       cat an) = cat++" "++an
-showContexts (Word    w)        = show w
-showContexts (WordTag w cat an) = show w++"\t"++cat++" "++an
-showContexts BIND_TAG           = "*BIND*"
-showContexts END                = "*END*"
-
 doTraining gr cnc corpus_path out_path = do
   es <- fmap (mapMaybe toExpr . lines) $ readFile corpus_path
   putStrLn ("Read "++show (length es)++" sentences")
@@ -62,27 +39,30 @@ doTraining gr cnc corpus_path out_path = do
           mapAccumL addIndex emptyIndex
                     [Tag cat an | (w,ans) <- fullFormLexicon cnc, (f,an,_) <- ans
                                 , Just (_,cat,_) <- [fmap unType (functionType gr f)]]
-      fcounts0 = emptyIndex
-      (cSize,hcounts,tcounts,fvalues0) =
-          foldl (\st -> extractFeatures left3words st . getContexts)
-                (0,hcounts0,tcounts0,fcounts0)
-                es
-      (fSize,fvalues) = Map.mapAccumWithKey keepPopulated 0 fvalues0
+      fvalues0     = emptyIndex
+      contexts     = map getContexts es
+      wordCounts   = foldl' (foldl' addWordCount) Map.empty contexts
+      (cSize,hcounts,tcounts,fvalues1) =
+          foldl (\st -> extractFeatures wordCounts left3words naacl2003unknowns st)
+                (0,hcounts0,tcounts0,fvalues0)
+                contexts
+      (fSize,fvalues) = Map.mapAccumWithKey keepPopulated 0 fvalues1
       y2tag =
         V.replicate (Map.size hcounts) undefined V.// 
                     [(i, t) | (t,(i,c)) <- Map.toList tcounts]
   putStrLn ("Processed "++show (cSize-length es)++" words")
+  putStrLn (show (sum (map snd (Map.toList wordCounts))))
   putStrLn ("Found that xSize="++show (Map.size hcounts)++" and ySize="++show (Map.size tcounts))
   putStrLn ("Found "++show (Map.size fvalues)++" unique features")
   putStrLn ("Found "++show (sum (fmap (\(_,tags) -> length tags) fvalues))++" templates, "++
             "populated "++show fSize++" templates")
   let (fun,grad,comb) = maxentProblem 0.5 hcounts tcounts fvalues
   (lam,res,stat) <- optimize defaultParameters{verbose=VeryVerbose} 1e-4
-                             (VS.replicate fSize 0.0) 
+                             (VS.replicate fSize 0.0)
                              fun grad (Just comb)
   putStrLn ("Model saved in "++out_path)
   writeModel out_path (Set.fromList [w | Word w <- Map.keys tcounts])
-                      [((i,val,y2tag V.! t),lam VS.! j) | ((i,val),(Right hists,tags)) <- Map.toList fvalues, (j,t,c) <- tags]
+                      [((val,y2tag V.! t),lam VS.! j) | (val,(Right hists,tags)) <- Map.toList fvalues, (j,t,c) <- tags]
   where
     toExpr ('a':'b':'s':':':' ':ls) = readExpr ls
     toExpr _                        = Nothing
@@ -101,12 +81,16 @@ doTraining gr cnc corpus_path out_path = do
             Just (hs,_,_) -> Just (length hs)
             Nothing       -> Nothing
 
+    addWordCount counts (Word w)        = Map.insertWith (+) w 1 counts
+    addWordCount counts (WordTag w _ _) = Map.insertWith (+) w 1 counts
+    addWordCount counts _               = counts
+
 doTagging gr cnc model_path corpus_path output_path = do
   putStrLn ("Reading "++model_path)
   model <- readModel model_path
   ls <- fmap (map (map (toTags model Map.empty) . filterBest . lookupCohorts cnc) . lines) $ readFile corpus_path
   putStrLn ("Output saved in "++output_path)
-  writeFile output_path ((unlines . concat . intersperse [""]) (map (map show . tagSentence model left3words [(replicate 2 START,(0,[]))]) ls))
+  writeFile output_path ((unlines . concat . intersperse [""]) (map (map show . tagSentence model left3words naacl2003unknowns [(replicate 2 START,(0,[]))]) ls))
   where
     toTags model tags (i,w,[]                       ,j) =
       let context0 = Map.toList tags
@@ -124,26 +108,26 @@ doTagging gr cnc model_path corpus_path output_path = do
                       Map.insert tag (i,w,an:ans,j) tags
       in toTags model tags' (i,w,ans,j)
 
-    tagSentence model extractors lefts []                     =
+    tagSentence model extractorsG extractorsR lefts []                     =
       head [reverse anns | (left,(p,anns)) <- lefts, p == maximum [p | (left,(p,anns)) <- lefts]]
-    tagSentence model extractors lefts ((wtag,context):right) =
+    tagSentence model extractorsG extractorsR lefts ((wtag,context):right) =
       let lefts' =
             argMax [left'
                       | left  <- lefts
-                      , left' <- shift model extractors
+                      , left' <- shift model extractorsG extractorsR
                                        left wtag context (map fst right++repeat END)
                    ]
-      in tagSentence model extractors lefts' right
+      in tagSentence model extractorsG extractorsR lefts' right
 
-    shift (words,probs) extractors (left,(p,anns)) wtag context right =
+    shift (words,probs) extractorsG extractorsR (left,(p,anns)) wtag context right =
       norm [(comb wtag tag:init left,lambdas tag,ann:anns) | (tag,ann) <- context]
       where
         comb (Word w) (Tag cat field) = WordTag w cat field
         comb _        tag             = tag
 
         lambdas tag =
-          sum [Map.findWithDefault 0 (i,extractor left wtag right,tag) probs
-                           | (i,extractor) <- zip [0..] extractors]
+          sum [Map.findWithDefault 0 (extractor left wtag right,tag) probs
+                           | extractor <- extractorsG]
 
         norm lefts = [(left,(c-s+p,anns)) | (left,c,anns) <- lefts]
           where
@@ -167,21 +151,32 @@ doHelp = do
   putStrLn ("<input path>    must contain one sentence per line")
   putStrLn ("<output path>   must point to the file to be generated")
 
-extractFeatures extractors st = collect st (repeat START)
+extractFeatures wordCounts extractorsG extractorsR st =
+  collect st (repeat START)
   where
     collect (!cSize,hcounts,tcounts,fvalues) left []              =
-      let history      = [extractor left END (repeat END) | extractor <- extractors]
+      let history      = [val | extractor <- extractorsG
+                              , let val = extractor left END (repeat END)
+                              , val /= None]
           tag          = END
           (hcounts',x) = addIndex hcounts history
           (tcounts',y) = addIndex tcounts tag
-          fvalues'     = foldl (addValue x y) fvalues (zip [0..] history)
+          fvalues'     = foldl (addValue x y) fvalues history
       in (cSize+1,hcounts',tcounts',fvalues')
     collect (!cSize,hcounts,tcounts,fvalues) left (context:right) =
-      let history      = [extractor left context (right++repeat END) | extractor <- extractors]
+      let extractors   = case wordOnly context of
+                           Word w -> case Map.lookup w wordCounts of
+                                       Just n | n > 5 -> extractorsG
+                                       _              -> extractorsG {- ++
+                                                         extractorsR -}
+                           _                          -> extractorsG
+          history      = [val | extractor <- extractors
+                              , let val = extractor left context (right++repeat END)
+                              , val /= None]
           tag          = tagOnly context
           (hcounts',x) = addIndex hcounts history
           (tcounts',y) = addIndex tcounts tag
-          fvalues'     = foldl (addValue x y) fvalues (zip [0..] history)
+          fvalues'     = foldl (addValue x y) fvalues history
       in collect (cSize+1,hcounts',tcounts',fvalues') (context:left) right
 
 emptyIndex = Map.empty
@@ -197,28 +192,16 @@ addValue hist tag values x =
                           (\(hists,tags) -> (Set.insert hist hists,Map.insertWith (+) tag 1 tags)))
             x values
 
-keepPopulated !lindex (fNo,val) (hists,tags)
+keepPopulated !lindex val (hists,tags)
   | mustKeep  = (lindex+Map.size tags,(Right (Set.toList hists),annotate tags))
   | otherwise = (lindex              ,(Left  size              ,annotate tags))
   where
-    mustKeep | fNo == 0  = size > 2
-             | otherwise = size > 5
-    size                 = length hists
-    
+    mustKeep = case val of
+                 CurrWord _ -> size > 2
+                 _          -> size > 5
+    size     = length hists
+
     annotate = zipWith (\i (t,c) -> (i,t,c)) [lindex..] . Map.toList
-
-
-type Extractor = [Context] -> Context -> [Context] -> [Context]
-
-left3words :: [Extractor]
-left3words = [leftWord,currWord,rightWord,last2Tags,leftTag]
-
-leftWord  (tag:left) example      right  = [wordOnly tag]
-currWord       left  example      right  = [wordOnly example]
-rightWord      left  example (tag:right) = [wordOnly tag]
-
-leftTag   (w:left)   example right = [tagOnly w]
-last2Tags (u:v:left) example right = [tagOnly u,tagOnly v]
 
 type Matrix = MV.IOVector Double
 
