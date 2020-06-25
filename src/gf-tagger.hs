@@ -383,7 +383,7 @@ maxentProblem sigmaSquared hcounts tcounts fvalues =
           getSum probConds hs t (s + (ptilde VS.! h) * pc)
 
 readCorpus corpus_path =
-  fmap (take 1000 . mapMaybe toExpr . lines) $ readFile corpus_path
+  fmap (mapMaybe toExpr . lines) $ readFile corpus_path
   where
     toExpr ('a':'b':'s':':':' ':ls) = readExpr ls
     toExpr _                        = Nothing
