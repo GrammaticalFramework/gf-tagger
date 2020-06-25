@@ -32,6 +32,8 @@ main = do
                                    -> doTesting gr cnc ex_path
                                 ["-tag",model_path,inp_path,out_path]
                                    -> doTagging gr cnc model_path inp_path out_path
+                                ["-tokenize",inp_path,out_path]
+                                   -> doTokenize gr cnc inp_path out_path
                                 _  -> doHelp
     _                              -> doHelp
 
@@ -158,7 +160,7 @@ doTagging gr cnc model_path corpus_path output_path = do
   ls <- fmap lines $ readFile corpus_path
   putStrLn ("Output saved in "++output_path)
   writeFile output_path ((unlines . concat . intersperse [""] . map (map show .tagSentence gr cnc model)) ls)
-  
+
 tagSentence gr cnc model =
   bestSeq model left3words naacl2003unknowns [(replicate 2 START,(0,[]))] .
   map (toTags model Map.empty) .
@@ -212,6 +214,11 @@ tagSentence gr cnc model =
         max (p1,ann1) (p2,ann2)
           | p1 > p2   = (p1,ann1)
           | otherwise = (p2,ann2)
+
+doTokenize gr cnc corpus_path output_path = do
+  ls <- fmap lines $ readFile corpus_path
+  putStrLn ("Output saved in "++output_path)
+  writeFile output_path ((unlines . concat . intersperse [""] . map (map show . filterBest .lookupCohorts cnc)) ls)
 
 doHelp = do
   name <- getProgName
