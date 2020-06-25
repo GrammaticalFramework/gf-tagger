@@ -223,9 +223,10 @@ doTokenize gr cnc corpus_path output_path = do
 doHelp = do
   name <- getProgName
   putStrLn ("Synopsis:")
-  putStrLn ("   "++name++"<pgf path> <concrete syntax> -train <examples path> <output path>")
-  putStrLn ("   "++name++"<pgf path> <concrete syntax> -test  <examples path>")
-  putStrLn ("   "++name++"<pgf path> <concrete syntax> -tag   <model path> <input path> <output path>")
+  putStrLn ("   "++name++" <pgf path> <concrete syntax> -train <examples path> <output path>")
+  putStrLn ("   "++name++" <pgf path> <concrete syntax> -test  <examples path>")
+  putStrLn ("   "++name++" <pgf path> <concrete syntax> -tag   <model path> <input path> <output path>")
+  putStrLn ("   "++name++" <pgf path> <concrete syntax> -tokenize <input path> <output path>")
   putStrLn ("")
   putStrLn ("<examples path> must contain abstract syntax trees, one per line prefixed with \"abs:\"")
   putStrLn ("<model path>    must contain the trained model")
