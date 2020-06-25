@@ -59,9 +59,11 @@ doTesting gr cnc corpus_path = do
       all_contexts = map (getContexts gr cnc) es
       len          = es_len `div` 10
       partition    = chunk (shuffle' all_contexts es_len g) [] es_len len
-  as <- cross_validate hcounts0 tcounts0 fvalues0 1 partition
-  print as
-  print (sum as / fromIntegral (length as))
+  ms <- cross_validate hcounts0 tcounts0 fvalues0 1 partition
+  print ms
+  let (ps,rs,fs) = unzip3 ms
+      l          = fromIntegral (length ms)
+  print (sum ps / l,sum rs / l,sum fs / l)
   where
     chunk xs yss l len
       | l-len < len = [(concat yss,xs)]
@@ -73,37 +75,40 @@ doTesting gr cnc corpus_path = do
     cross_validate hcounts0 tcounts0 fvalues0 i ((tr_contexts,ev_contexts):partition) = do
       putStrLn ("Evaluation on partion "++show i)
       model <- trainModel hcounts0 tcounts0 fvalues0 tr_contexts
-      (c,t) <- evaluate model ev_contexts 0 0
-      let a = fromIntegral c/fromIntegral t
-      print (c,t,a)
-      as <- cross_validate hcounts0 tcounts0 fvalues0 (i+1) partition
-      return (a:as)
+      (c,t1,t2) <- evaluate model ev_contexts 0 0 0
+      let p = fromIntegral c/fromIntegral t1
+          r = fromIntegral c/fromIntegral t2
+          f = fromIntegral (2*c)/fromIntegral (t1+t2)
+      print (p,r,f)
+      ms <- cross_validate hcounts0 tcounts0 fvalues0 (i+1) partition
+      return ((p,r,f):ms)
       where
-        evaluate model []                     c t = return (c,t)
-        evaluate model (contexts:ev_contexts) c t = do
+        evaluate model []                     c t1 t2 = return (c,t1,t2)
+        evaluate model (contexts:ev_contexts) c t1 t2 = do
           let sent = contexts2sentence "" contexts
-          (c,t) <- count sent (map restoreTag (tagSentence gr cnc model sent)) contexts c t
-          evaluate model ev_contexts c t
+          (c,t1,t2) <- count sent (map restoreTag (tagSentence gr cnc model sent)) contexts c t1 t2
+          evaluate model ev_contexts c t1 t2
 
-        contexts2sentence space []                       = ""
-        contexts2sentence space (BIND_TAG     :contexts) =
+        contexts2sentence space []                             = ""
+        contexts2sentence space ((_,BIND_TAG     ,_):contexts) =
           contexts2sentence "" contexts
-        contexts2sentence space (Word w       :contexts) =
+        contexts2sentence space ((_,Word w       ,_):contexts) =
           space++w++contexts2sentence " " contexts
-        contexts2sentence space (WordTag w _ _:contexts) =
+        contexts2sentence space ((_,WordTag w _ _,_):contexts) =
           space++w++contexts2sentence " " contexts
 
-        count sent []           []           !c !t = return (c,t)
-        count sent (tag1:tags1) (tag2:tags2) !c !t
-          | tag1 == tag2 = count sent tags1 tags2 (c+1) (t+1)
-          | otherwise    = count sent tags1 tags2 c     (t+1)
-        count sent tags1        tags2        !c !t = do
-          putStrLn "Warning: missmatching sizes, for:"
-          putStrLn sent
-          return (c,t)
+        count sent []                   []                   !c !t1 !t2 = return (c,t1,t2)
+        count sent []                   (_           :tags2) !c !t1 !t2 = count sent [] tags2 c t1 (t2+1)
+        count sent (_           :tags1) []                   !c !t1 !t2 = count sent tags1 [] c (t1+1) t2
+        count sent ((i1,tag1,j1):tags1) ((i2,tag2,j2):tags2) !c !t1 !t2 =
+          case compare (i1,j1) (i2,j2) of
+            LT                -> count sent tags1 ((i2,tag2,j2):tags2) c (t1+1) t2
+            EQ | tag1 == tag2 -> count sent tags1 tags2 (c+1) (t1+1) (t2+1)
+               | otherwise    -> count sent tags1 tags2 c     (t1+1) (t2+1)
+            GT                -> count sent ((i1,tag1,j1):tags1) tags2 c t1 (t2+1)          
 
-        restoreTag (i,w,[],j)                     = Word w
-        restoreTag (i,w,(fn,field,fn_prob):ans,j) = WordTag w cat field
+        restoreTag (i,w,[],j)                     = (i,Word w,j)
+        restoreTag (i,w,(fn,field,fn_prob):ans,j) = (i,WordTag w cat field,j)
           where
             Just (_,cat,_) = fmap unType (functionType gr fn)
 
@@ -112,19 +117,30 @@ getLexicalTags gr cnc =
             [Tag cat an | (w,ans) <- fullFormLexicon cnc, (f,an,_) <- ans
                         , Just (_,cat,_) <- [fmap unType (functionType gr f)]]
 
-getContexts :: PGF -> Concr -> Expr -> [Context]
-getContexts gr cnc e = concatMap tags (bracketedLinearize cnc e)
+getContexts :: PGF -> Concr -> Expr -> [(Int,Context,Int)]
+getContexts gr cnc e =
+  brackets (bracketedLinearize cnc e) (\_ _ -> []) 0 0
   where
-	tags (Leaf w)                = [Word w]
-	tags BIND                    = [BIND_TAG]
-	tags b@(Bracket cat _ an fun bs)
-	  | arity fun == Just 0      = [WordTag (unwords (flattenBracketedString b)) cat an]
-	  | otherwise                = concatMap tags bs
+    brackets []     cont = cont
+    brackets (b:bs) cont = bracket b (brackets bs cont)
 
-	arity fun =
-	  case fmap unType (functionType gr fun) of
-		Just (hs,_,_) -> Just (length hs)
-		Nothing       -> Nothing
+    bracket (Leaf w)                    cont i d =
+      let j = i+d
+          k = j + length w
+      in (j,Word w,k) : cont k 1
+    bracket BIND                        cont i d =
+      (i,BIND_TAG,i) : cont i 0
+    bracket b@(Bracket cat _ an fun bs) cont i d
+      | arity fun == Just 0 = let w = unwords (flattenBracketedString b)
+                                  j = i+d
+                                  k = j + length w
+                              in (j,WordTag w cat an,k) : cont k 1
+      | otherwise           = brackets bs cont i d
+
+    arity fun =
+      case fmap unType (functionType gr fun) of
+        Just (hs,_,_) -> Just (length hs)
+        Nothing       -> Nothing
 
 trainModel hcounts0 tcounts0 fvalues0 contexts = do
   let wordCounts   = foldl' (foldl' addWordCount) Map.empty contexts
@@ -149,9 +165,9 @@ trainModel hcounts0 tcounts0 fvalues0 contexts = do
          ,Map.fromList [((val,y2tag V.! t),lam VS.! j) | (val,(Right hists,tags)) <- Map.toList fvalues, (j,t,c) <- tags]
          )
   where
-    addWordCount counts (Word w)        = Map.insertWith (+) w 1 counts
-    addWordCount counts (WordTag w _ _) = Map.insertWith (+) w 1 counts
-    addWordCount counts _               = counts
+    addWordCount counts (_,Word w,_)        = Map.insertWith (+) w 1 counts
+    addWordCount counts (_,WordTag w _ _,_) = Map.insertWith (+) w 1 counts
+    addWordCount counts _                   = counts
 
 
 doTagging gr cnc model_path corpus_path output_path = do
@@ -245,7 +261,7 @@ extractFeatures wordCounts extractorsG extractorsR st =
           (tcounts',y) = addIndex tcounts tag
           fvalues'     = foldl (addValue x y) fvalues history
       in (cSize+1,hcounts',tcounts',fvalues')
-    collect (!cSize,hcounts,tcounts,fvalues) left (context:right) =
+    collect (!cSize,hcounts,tcounts,fvalues) left ((i,context,j):right) =
       let extractors   = case wordOnly context of
                            Word w -> case Map.lookup w wordCounts of
                                        Just n | n > 5 -> extractorsG
@@ -253,13 +269,15 @@ extractFeatures wordCounts extractorsG extractorsR st =
                                                          extractorsR -}
                            _                          -> extractorsG
           history      = [val | extractor <- extractors
-                              , let val = extractor left context (right++repeat END)
+                              , let val = extractor left context (map snd3 right++repeat END)
                               , val /= None]
           tag          = tagOnly context
           (hcounts',x) = addIndex hcounts history
           (tcounts',y) = addIndex tcounts tag
           fvalues'     = foldl (addValue x y) fvalues history
       in collect (cSize+1,hcounts',tcounts',fvalues') (context:left) right
+
+    snd3 (_,x,_) = x
 
 emptyIndex = Map.empty
 
